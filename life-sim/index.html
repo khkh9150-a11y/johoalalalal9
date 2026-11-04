@@ -8520,8 +8520,8 @@ function hpi(y) {
 const homePrice = (s, k = 0) => Math.round(HOME_P[RG(s)][k] * hpi(YEAR(s)) / 100) * 100;
 /* 직장 규모 · 기본 연봉(2026 신입 세전) · 연 상승률 · 승진 가산 */
 const SIZE_T = {
-  대기업:   { base:5000, g:0.028, r:0.09 }, 중견: { base:3800, g:0.024, r:0.08 }, 중소: { base:2900, g:0.02, r:0.06 },
-  공공기관: { base:4000, g:0.028, r:0.08 }, 공무원: { base:2950, g:0.028, r:0.07 }, 전문직: { base:7000, g:0.03, r:0.15 },
+  대기업:   { base:4700, g:0.019, r:0.07 }, 중견: { base:3800, g:0.02, r:0.065 }, 중소: { base:2900, g:0.017, r:0.06 },
+  공공기관: { base:3800, g:0.021, r:0.065 }, 공무원: { base:2950, g:0.021, r:0.07 }, 전문직: { base:7000, g:0.026, r:0.15 },
   자영업:   { base:3500, g:0, r:0.35, vol:0.45 }, 프리랜서: { base:2200, g:0, r:0.6, vol:0.6 }, 비정규: { base:2400, g:0.01, r:0.05 },
 };
 const SIZES = Object.keys(SIZE_T);
@@ -8550,7 +8550,8 @@ function jobBase(s, k, size) {
 }
 function calcSal(s) {
   const j = s.job; if (!j) return 0;
-  const T = SIZE_T[j.size] || SIZE_T.중소; const yrs = Math.max(0, s.age - (j.since || s.age));
+  const T = SIZE_T[j.size] || SIZE_T.중소; const st = j.since || s.age, ov = (lo, hi) => Math.max(0, Math.min(s.age, hi) - Math.max(st, lo));
+  const yrs = ov(0, 40) + ov(40, 55) * 0.3;   // 40~55세 호봉 상승 둔화, 55세 이후 정체
   let v = j.base * Math.pow(1 + T.g, yrs) * Math.pow(1 + T.r, j.lv || 0) * (j.pm || 1);
   if (['대기업','중견','중소','공공기관'].includes(j.size) && s.age >= 55) v *= Math.max(0.6, Math.pow(0.9, s.age - 54));
   return Math.max(Math.round(v), 0);
@@ -8603,24 +8604,68 @@ function moveRegion(s, r) {
   if (s.as.전세금) { s.money += s.as.전세금; s.as.전세금 = 0; }
   s.region = r; s.city = pick(REG_CITY[r]); if (s.age >= 20) s.as.집 = '월세'; s.tmp.지역 = r;
 }
-function buyHome(s) {
-  freeInit(s); realInit(s);
-  const P = homePrice(s, 0), ltv = RG(s) === '서울' ? 0.5 : 0.7;
-  const inc = s.job ? s.job.sal || 0 : 0, spouse = s.flags.기혼 && s.flags.맞벌이 ? 3000 : 0;
-  const dsrMax = Math.round((inc + spouse) * 0.4 / 0.075);   // 30년 4% 원리금 ≈ 대출의 7.5%/년
-  if (s.as.전세금) { s.money += s.as.전세금; s.as.전세금 = 0; }
-  const loan = Math.min(Math.round(P * ltv), dsrMax, Math.max(0, P - 0));
-  const need = P - loan; const got = pullCash(s, need);
-  s.as.빚 += loan + (need - got); s.as.집 = '자가'; s.as.집값 = P; s.flags.내집 = 1; s.tmp.집값 = fmtM(P);
-  note(s, `${s.region}에 ${fmtM(P)}짜리 집을 샀다`);
+// 주거 정산: 기존 집/전세금을 현금화하고 그 돈으로 대출부터 갚는다(순자산 불변)
+function settleHousing(s) {
+  const A = s.as;
+  if (A.연금누적) { s.money -= Math.min(A.연금누적, A.집값 || 0); A.연금누적 = 0; s.flags.주택연금 = 0; }
+  if (A.집 === '자가' && A.집값) { s.money += A.집값; A.집값 = 0; s.flags.내집 = 0; }
+  if (A.전세금) { s.money += A.전세금; A.전세금 = 0; }
+  if (A.빚 > 0 && s.money > 0) { const p = Math.min(A.빚, s.money); A.빚 -= p; s.money -= p; }
+  if (A.빚 > 0 && A.저축 > 0) { const p = Math.min(A.빚, A.저축); A.빚 -= p; A.저축 -= p; }
+}
+function dsrRoom(s) {   // DSR 40%: 연 원리금 ≤ 소득×0.4, 기존 빚 차감
+  const inc = (s.job ? s.job.sal || 0 : 0) + (s.flags.기혼 && s.flags.맞벌이 ? 3000 : 0) + (s.age >= 65 ? pensionY(s) || 0 : 0);
+  return Math.max(0, Math.round(inc * 0.4 / 0.055) - (s.as.빚 || 0));
+}
+function buyHome(s, P0) {
+  freeInit(s); realInit(s); settleHousing(s);
+  const P = P0 || homePrice(s, 0), ltv = RG(s) === '서울' ? 0.5 : 0.7;
+  const cash = Math.max(0, s.money - 500) + (s.as.저축 || 0), room = dsrRoom(s);
+  // 살 수 있는 최대 집값: 현금 ≥ (1-LTV)·가격, 대출 ≤ DSR 한도
+  const Pmax = Math.min(P, Math.floor(cash / (1 - ltv)), cash + room);
+  if (Pmax < P * 0.3) {   // 한도 밖이면 사지 못하고 전세로
+    note(s, '대출 한도(LTV·DSR)가 모자라 매수를 접었다'); s.tmp.매수실패 = 1; rentHome(s, 'jeonse'); return false;
+  }
+  const loan = Math.max(0, Pmax - cash), got = pullCash(s, Pmax - loan);
+  s.as.빚 += loan + Math.max(0, Pmax - loan - got); s.as.집 = '자가'; s.as.집값 = Pmax; s.as.주담대 = loan; s.flags.내집 = 1; s.tmp.집값 = fmtM(Pmax);
+  note(s, `${s.region}에 ${fmtM(Pmax)}짜리 ${Pmax < P * 0.9 ? '작은 ' : ''}집을 샀다`); return true;
 }
 function rentHome(s, k) {
-  freeInit(s); realInit(s);
-  if (s.as.집 === '자가') { const sell = s.as.집값 || 0; s.money += sell; s.as.집값 = 0; }
+  freeInit(s); realInit(s); settleHousing(s);
   if (k === 'jeonse') {
-    const J = Math.round(homePrice(s, 1) * (s.flags.기혼 || s.kids.length ? 1 : 0.45)); if (s.as.전세금) { s.money += s.as.전세금; s.as.전세금 = 0; }
+    const J0 = Math.round(homePrice(s, 1) * (s.flags.기혼 || s.kids.length ? 1 : 0.45));
+    const cash = Math.max(0, s.money - 300) + (s.as.저축 || 0), loanMax = Math.min(Math.round(J0 * 0.8), dsrRoom(s) * 1.3);
+    const J = Math.min(J0, cash + loanMax);
+    if (J < J0 * 0.3) { s.as.집 = '월세'; s.tmp.집값 = fmtM(RENT_Y[RG(s)] / 12) + '/월'; note(s, '전세금이 모자라 월세로 갔다'); return; }
     const got = pullCash(s, J); s.as.빚 += J - got; s.as.전세금 = J; s.as.집 = '전세'; s.tmp.집값 = fmtM(J);
-  } else { if (s.as.전세금) { s.money += s.as.전세금; s.as.전세금 = 0; } s.as.집 = '월세'; s.tmp.집값 = fmtM(RENT_Y[RG(s)] / 12) + '/월'; }
+  } else { s.as.집 = '월세'; s.tmp.집값 = fmtM(RENT_Y[RG(s)] / 12) + '/월'; }
+}
+// 매년: 주담대 원리금 상환, 은퇴 후 다운사이징·주택연금
+function housingYear(s) {
+  const A = s.as, a = s.age; if (!A) return;
+  if (A.빚 > 0 && a < 75) {   // 원금 분할상환(남은 기간 max(10, 65-나이)년), 현금→저축 순
+    const yrs = Math.max(10, 65 - a), due = Math.min(A.빚, Math.ceil(A.빚 / yrs));
+    const got = pullCash(s, due); A.빚 -= got;
+  }
+  const own = A.집 === '자가' && A.집값 > 0;
+  if (a >= 60 && own) {
+    const short = s.money < -500 || A.빚 > A.집값 * 0.25 || (a >= 70 && A.빚 > 0);
+    if (short && !s.flags.주택연금) {
+      if (A.빚 > A.집값 * 0.5 || (s.money < -500 && rnd() < 0.3)) {   // 다운사이징: 팔고 반값 집으로
+        const P = Math.round(A.집값 * 0.5); settleHousing(s); const got = pullCash(s, P);
+        A.집 = '자가'; A.집값 = got; s.flags.내집 = 1; if (got < P * 0.5) { s.money += got; A.집값 = 0; A.집 = '전세'; A.전세금 = 0; rentHome(s, 'jeonse'); }
+        note(s, '은퇴 후 집을 줄여 대출을 정리했다'); s.flags.다운사이징 = a;
+      } else { settleHousingDebtOnly(s); s.flags.주택연금 = a; note(s, '주택연금에 가입했다'); }
+    }
+    if (s.flags.주택연금 && A.집 === '자가') {   // 매년 집값의 약 3.5% 지급, 누적액은 집값 한도(비소구)
+      const pay = Math.round(A.집값 * 0.035); A.연금누적 = (A.연금누적 || 0) + pay; s.money += pay;
+    }
+  }
+  if (a >= 65 && !own && s.money < -3000 && A.전세금 > 0) { rentHome(s, 'rent'); }
+  if (A.빚 > 0 && s.money > 0 && a >= 65) { const p = Math.min(A.빚, s.money); A.빚 -= p; s.money -= p; }
+}
+function settleHousingDebtOnly(s) {   // 주택연금 가입 시 기존 주담대를 일시 상환(연금 선지급)
+  const A = s.as; if (A.빚 > 0) { const d = Math.min(A.빚, Math.round(A.집값 * 0.5)); A.빚 -= d; A.연금누적 = (A.연금누적 || 0) + d; }
 }
 Object.assign(SPECIAL_EXT, {
   move(s, r) { moveRegion(s, r); note(s, `${r}로 이사했다`); },
@@ -8636,6 +8681,7 @@ Object.assign(SPECIAL_EXT, {
   sellstock(s) { freeInit(s); s.money += s.as.주식; s.tmp.투자액 = fmtM(s.as.주식); s.as.주식 = 0; },
   sellcoin(s) { freeInit(s); s.money += s.as.코인; s.tmp.투자액 = fmtM(s.as.코인); s.as.코인 = 0; },
   repay(s, x) { freeInit(s); const p = Math.min(Math.max(0, s.money), s.as.빚, _amt(s, x, s.as.빚)); s.money -= p; s.as.빚 -= p; },
+  house(s, k) { if (k === 'buy') buyHome(s); else if (k === 'jeonse') rentHome(s, 'jeonse'); else rentHome(s, 'rent'); },
   buyhome(s) { buyHome(s); }, jeonse(s) { rentHome(s, 'jeonse'); }, wolse(s) { rentHome(s, 'rent'); },
   house(s, k) { if (k === 'buy') buyHome(s); else rentHome(s, k === 'jeonse' ? 'jeonse' : 'rent'); },
   branch(s, b) { realInit(s); s.mil.br = MIL_MO[b] != null ? b : '육군'; },
@@ -8826,11 +8872,13 @@ E({ id:'rz_leave', a:[25,50], chain:true, man:true, if: s => !!s.job && s.kids.l
 { const e = EVENTS.find(x => x.id === 'f_birth'); if (e) for (const c of e.c) for (const o of c[1]) if (/\$child/.test(o[1]) && !/rz_leave/.test(o[1])) o[1] += ' >rz_leave:0'; }
 
 /* ---------------- 집 · 돈 ---------------- */
-E({ id:'rz_home', a:[30,62], rep:true, cd:4, w:3, man:true, if: s => !!s.as && s.as.집 !== '자가' && !UNI(s) && RZ.cash(s) >= homePrice(s, 0) * 0.25 && (s.flags.기혼 || s.age >= 35),
+E({ id:'rz_home', a:[29,65], force:true, rep:true, cd:3, man:true, if: s => !!s.as && s.as.집 !== '자가' && !UNI(s) && !s.flags.군인 && RZ.cash(s) + (s.as.전세금 || 0) * 0.5 >= homePrice(s, 0) * (s.age >= 40 ? 0.13 : 0.18) && (s.flags.기혼 || s.age >= 32),
   t: s => `${YEAR(s)}년. 모은 돈 ${fmtM(RZ.cash(s))}. ${s.region} 아파트 시세는 ${fmtM(homePrice(s, 0))}. 집을 살까?`,
   c:[
     ['지금 사는 지역에서 매수', [['계약서에 도장을 찍었다. 대출 이자가 무섭다.', '$buyhome 행복+5', 1, '집을 샀다']]],
     ['경기도로 옮겨 매수', [['출퇴근은 멀어졌지만 내 집이 생겼다.', '$move:경기 $buyhome 행복+4', 1, '경기도에 집을 샀다']], s => s.region === '서울'],
+    ['무주택자 청약 (가점제·추첨제)', [['청약 당첨! 분양가로 내 집이 생겼다.', '$buyhome 행복+8', s => clamp(.25 + (s.kids.length * .08) + (s.flags.기혼 ? .1 : 0), .2, .6), '청약에 당첨됐다'], ['낙첨. 다음 분양을 노린다.', '행복-2', .55]], s => RZ.Y(s) >= 1990],
+    ['더 싼 지방·외곽 아파트로 매수', [['조금 작고 멀지만 내 집이다.', '$move:충남 $buyhome 행복+3', 1, '외곽에 집을 샀다']], s => RG(s) !== '지방'],
     ['전세로 버틴다', [['아직은 때가 아니다.', '$jeonse'], ['전세 계약 만료. 보증금을 올려 달란다.', '$jeonse 행복-2']]],
     ['청약 가점을 더 모은다', [['무주택 기간이 길수록 유리하다.', '성실+1']]],
   ]});
@@ -16115,7 +16163,7 @@ function freeInit(s) {
   return s;
 }
 function apMax(s) { const a = s.age; return a <= 2 ? 1 : a <= 6 ? 2 : a >= 85 ? 2 : 3; }
-function netWorth(s) { const A = s.as || {}; return Math.round(s.money + (A.저축 || 0) + (A.주식 || 0) + (A.코인 || 0) + (A.집 === '자가' ? A.집값 || 0 : 0) + (A.전세금 || 0) - (A.빚 || 0)); }
+function netWorth(s) { const A = s.as || {}; return Math.round(s.money + (A.저축 || 0) + (A.주식 || 0) + (A.코인 || 0) + (A.집 === '자가' ? Math.max(0, (A.집값 || 0) - (A.연금누적 || 0)) : 0) + (A.전세금 || 0) - (A.빚 || 0)); }
 function skUp(s, k, n) { if (!SKILLS.includes(k)) return 0; const b = s.sk[k] || 0; const gain = n > 0 ? Math.max(1, Math.round(n * (1 - b / 130))) : n; s.sk[k] = clamp(b + gain, 0, 100); return s.sk[k] - b; }
 function condAdd(s, k) { if (!COND_DEF[k] || s.cond[k] != null) return false; s.cond[k] = s.age; return true; }
 function condDel(s, k) { if (s.cond[k] == null) return false; delete s.cond[k]; return true; }
@@ -21820,7 +21868,7 @@ function money(s) {
     if (y === 2020 && s.job.size === '자영업') sal = Math.round(sal * 0.7);
     s.job.sal = sal; R.gross = sal;
     if (a >= 40 && a <= 49) s.peakSal = Math.max(s.peakSal || 0, sal);
-    if (a === 45) s.sz40 = s.job.size;
+    if (a === 45) { s.sz40 = s.job.size; s.sal45 = sal; }
     const net = T.vol ? Math.round(sal * 0.84) : netPay(s, sal);
     R.net = net; inc += net;
     s.fin.np += 1; s.fin.npSum += sal;
@@ -21843,7 +21891,7 @@ function money(s) {
     if (s.fam.wealth <= 2 && pub && rnd() < 0.5) { A.빚 += 300; s.flags.학자금대출 = 1; inc += 300; }
   } else if (!s.flags.군인) {
     const rg = RG(s), home = withParents(s);
-    let live = LIVE_Y[rg] * (s.flags.기혼 ? 1.6 : 1) * (home ? 0.35 : 1) * (s.flags.은퇴 ? 0.8 : 1);
+    let live = LIVE_Y[rg] * (s.flags.기혼 ? 1.6 : 1) * (home ? 0.35 : 1) * (s.flags.은퇴 ? 0.95 : 1);
     if (!home && !A.집 && a >= 20) A.집 = '월세';
     if (A.집 === '월세') cost += RENT_Y[rg] * (s.flags.기혼 || s.kids.length ? 1.8 : 1);
     if (A.집 === '자가') cost += Math.round((A.집값 || 0) * 0.0015);
@@ -21857,13 +21905,21 @@ function money(s) {
     if (netWorth(s) < 60000 && y >= 2008) { inc += y >= 2026 ? 420 : y >= 2014 ? 300 : 100; R.basic = 1; }
   }
   if (A.빚 > 0) { const it = Math.round(A.빚 * (A.집 === '자가' ? 0.04 : 0.055)); cost += it; R.int = it; }
-  if (inc > cost) { const ex = Math.round((inc - cost) * 0.35); cost += ex; R.extra = ex; }   // 소득이 늘면 씀씀이도 는다(가계동향 평균소비성향 약 70%)
+  if (cost > inc && s.money + (A.저축 || 0) <= 0) {   // 모아 둔 돈이 없으면 씀씀이를 줄이고 기초생활보장·가족 지원으로 버틴다
+    const gap = cost - inc; cost = inc + Math.min(gap, a >= 60 ? 0 : 150); R.austerity = 1; s.flags.긴축 = 1;
+  }
+  if (inc > cost) { const ex = Math.round((inc - cost) * 0.65); cost += ex; R.extra = ex; }   // 소득이 늘면 씀씀이도 는다(가계동향 평균소비성향 약 70%)
   s.money += Math.round(inc - cost);
   // 여유 자금 자동 상환·저축(현금이 쌓이면 일부를 굴린다)
   if (A.빚 > 0 && s.money > 500) { const p = Math.min(A.빚, Math.round((s.money - 500) * 0.5)); A.빚 -= p; s.money -= p; }
   if (s.money > 6000 && !A.빚) { const sv = Math.round((s.money - 3000) * 0.5); s.money -= sv; A.저축 += sv; }
   if (s.money < 0 && A.저축 > 0) { const t = Math.min(A.저축, -s.money); A.저축 -= t; s.money += t; }
+  if (!s.flags.군인 && !UNI(s)) housingYear(s);
   if (s.money < -3000 && !s.flags.파산위기) { s.flags.파산위기 = a; }
+  if (a >= 55 && netWorth(s) < -3000 && !s.flags.개인회생) {   // 개인회생·채무조정: 갚을 수 있는 만큼만 남긴다
+    s.flags.개인회생 = a; const keep = -1500; const nw = netWorth(s); const cut = keep - nw;
+    const dc = Math.min(A.빚 || 0, cut); A.빚 -= dc; s.money += cut - dc; note(s, '개인회생으로 빚을 정리했다');
+  }
 }
 function healthYear(s) {
   realInit(s); const a = s.age, hb = s.hb;
@@ -21895,8 +21951,11 @@ annual = function (s) {
   schoolYear(s); money(s); healthYear(s);
   if (s.flags.군인 && (s.mil.mo || 0) >= 30 && s.mil.start != null) for (const q of s.queue) if (q.id === 'a_out' && q.at < s.mil.start + 3) q.at = s.mil.start + 3;   // 장교 36개월
   if (s.money < -5000) st.행복 = clamp(st.행복 - 2, 0, 100);
-  const dBefore = A.빚, sv0 = A.저축, hB = st.건강;
+  const dBefore = A.빚, sv0 = A.저축, hB = st.건강, c0 = A.코인 || 0, k0 = A.주식 || 0;
   freeAnnual(s);
+  if (c0 && A.코인) A.코인 = clamp(A.코인, Math.round(c0 * 0.4), Math.round(c0 * 1.6));   // 코인 연 -60%~+60%
+  if (k0 && A.주식) A.주식 = clamp(A.주식, Math.round(k0 * 0.6), Math.round(k0 * 1.35));   // 주식 연 -40%~+35%
+  if ((A.코인 || 0) + (A.주식 || 0) > 300000) { const r = 300000 / (A.코인 + A.주식); A.코인 = Math.round(A.코인 * r); A.주식 = Math.round(A.주식 * r); s.money += 0; }
   { const loss = hB - st.건강; if (loss > 2) st.건강 = clamp(Math.round(hB - 2 - (loss - 2) * 0.4), 0, 100); }   // 건강보험·만성질환 관리
   if (sv0 && A.저축) A.저축 = Math.round(A.저축 / 1.03 * 1.008);   // 실질 금리 0.8%
   if (A.주식) A.주식 = Math.round(A.주식 * 0.975);   // 실질 수익률 약 4%
